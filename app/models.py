@@ -224,6 +224,87 @@ class RepairResponse(BaseModel):
     )
 
 
+# ---------------------------------------------------------------------------
+# 统一余量放宽
+# ---------------------------------------------------------------------------
+
+
+def _validate_non_negative_int(value):
+    """非负整数字段的前置校验：只接受非负 int（拒绝 bool / 浮点 / 字符串）。
+
+    必须在 Pydantic 的宽松 int 收窄之前执行（Pydantic v2 会把
+    bool / 2.0 / "3" 默认接受为 int）。
+    """
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError("必须为非负整数")
+    if value < 0:
+        raise ValueError("必须为非负整数")
+    return value
+
+
+# 非负整数：经过前置严格类型校验的 int。
+NonNegativeInt = Annotated[int, BeforeValidator(_validate_non_negative_int)]
+
+
+class SlackRequest(DiagnosisRequest):
+    """统一余量放宽请求：沿用诊断字段，另给非负整数上限 L（字段名 limit）。"""
+
+    limit: NonNegativeInt = Field(
+        ...,
+        alias="L",
+        description="允许扩大的统一余量上限 L（非负整数毫秒，请求字段名 L）",
+    )
+
+    model_config = {"populate_by_name": True, "extra": "forbid"}
+
+
+class RelaxedObservation(BaseModel):
+    """一条放宽后的观测：x_target - x_source ∈ [min, max]（毫秒）。"""
+
+    id: str = Field(..., description="原观测 ID（与提交的观测一一对应）")
+    source: str = Field(..., description="被减时钟节点 A")
+    target: str = Field(..., description="被减时钟节点 B")
+    min: float = Field(..., alias="min", description="放宽后区间下界（原 min - k）")
+    max: float = Field(..., alias="max", description="放宽后区间上界（原 max + k）")
+
+    model_config = {"populate_by_name": True}
+
+
+class SlackFeasibleResponse(BaseModel):
+    """上限内找到最小统一余量时的响应。
+
+    ``slack`` 为使全组观测可行的最小非负整数 k（0 <= k <= L）；
+    ``observations`` 按原 ID 给出每条观测放宽后的区间（k=0 时即原区间）；
+    ``node_offsets`` 为覆盖全部求解节点的可行偏移见证（参考节点恒为 0）。
+    """
+
+    status: Literal["ok"] = "ok"
+    name: Optional[str] = None
+    reference: str
+    limit: int = Field(..., description="本次生效的放宽上限 L")
+    slack: int = Field(..., description="使全组可行的最小统一余量 k（0 <= k <= L）")
+    observations: List[RelaxedObservation] = Field(
+        ...,
+        description="按原 ID 对应的放宽后区间（按 ID 字典序）；k=0 时即原区间",
+    )
+    node_offsets: List[NodeOffset] = Field(
+        ...,
+        description="覆盖全部求解节点的可行偏移见证（按节点字典序），参考节点恒为 0",
+    )
+
+
+class SlackLimitExceededResponse(BaseModel):
+    """放宽到上限 L 仍不可行时的响应：不输出放宽区间与见证。"""
+
+    status: Literal["limit_exceeded"] = "limit_exceeded"
+    name: Optional[str] = None
+    reference: str
+    limit: int = Field(..., description="本次生效的放宽上限 L")
+
+
+SlackResponse = Union[SlackFeasibleResponse, SlackLimitExceededResponse]
+
+
 class CalibrationTargetIn(BaseModel):
     """校准目标：要求该节点相对参考节点的界宽不超过 max_width（毫秒）。"""
 

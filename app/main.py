@@ -45,6 +45,10 @@ from .models import (
     RedundancyItem,
     RepairRequest,
     RepairResponse,
+    SlackFeasibleResponse,
+    SlackLimitExceededResponse,
+    SlackRequest,
+    SlackResponse,
     TimePoint,
     WindowPeakRequest,
     WindowPeakResponse,
@@ -61,6 +65,7 @@ from .solver import (
     diagnose,
     diagnose_causal,
     diagnose_drift,
+    find_uniform_slack,
     plan_calibration,
     plan_window_peak,
     suggest_repair,
@@ -74,6 +79,8 @@ app = FastAPI(
         "可行时给出相对参考节点的最紧上下界及对应的证据链"
         "（lower_proof / upper_proof），不可行时返回稳定的矛盾环，"
         "并可进一步给出最小观测删除集合的修复建议；"
+        "统一余量放宽接口对全部观测同减下界、同加上界一个非负整数 k，"
+        "在上限 L 内二分使全组可行的最小 k，并给出放宽区间与全节点偏移见证；"
         "还可从带成本的候选观测中规划满足目标界宽的最小成本校准方案；"
         "另可在真实时间窗口下求同时入窗的最大事件集合及可行偏移见证；"
         "并可逐条审计观测区间是否已被其余观测蕴含（冗余审计）；"
@@ -83,7 +90,7 @@ app = FastAPI(
         "事件间最小间隔关系能否同时成立，可行时给出偏移见证与各事件真实时间，"
         "不可行时返回闭合负环。"
     ),
-    version="1.7.0",
+    version="1.8.0",
 )
 
 
@@ -336,6 +343,47 @@ def diagnose_repair(request: RepairRequest) -> RepairResponse:
         removed_observation_ids=removed_ids,
         limit_reached=False,
         diagnosis=_diagnosis_model(request.name, repaired),
+    )
+
+
+@app.post(
+    "/api/v1/diagnose/slack",
+    response_model=SlackResponse,
+    tags=["diagnosis"],
+)
+def diagnose_slack(request: SlackRequest) -> SlackResponse:
+    """统一余量放宽：求使全组观测同时成立的最小非负整数统一余量 k。
+
+    每条观测放宽为 ``[min - k, max + k]``（下界同减、上界同加同一个 k，
+    观测不删除），在 ``0 <= k <= L`` 内取使整组差分约束可行的最小值；
+    可行性由整组观测构成的约束图是否存在负环判定，不能由单条观测决定。
+    找到（status=ok）时返回 k、按原 ID 对应的放宽后区间（k=0 即原区间）
+    与参考节点偏移为 0 的全节点可行见证；即使放宽到 L 仍有负环时
+    status=limit_exceeded，不返回放宽区间与见证。重复 ID、非法区间或
+    非法（非非负整数）上限一律由请求校验返回 422。
+    """
+    result = find_uniform_slack(
+        nodes=request.effective_nodes(),
+        reference=request.reference,
+        observations=[_to_observation(o) for o in request.observations],
+        limit=request.limit,
+    )
+    if result["status"] == "limit_exceeded":
+        return SlackLimitExceededResponse(
+            name=request.name,
+            reference=result["reference"],
+            limit=result["limit"],
+        )
+    return SlackFeasibleResponse(
+        name=request.name,
+        reference=result["reference"],
+        limit=result["limit"],
+        slack=result["slack"],
+        observations=result["observations"],
+        node_offsets=[
+            NodeOffset(node=item["node"], offset=item["offset"])
+            for item in result["node_offsets"]
+        ],
     )
 
 

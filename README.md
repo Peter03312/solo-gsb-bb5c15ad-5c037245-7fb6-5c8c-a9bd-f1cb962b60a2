@@ -12,24 +12,29 @@
 4. **修复建议**：不可行时在不修改任何原观测的前提下，搜索使剩余系统恢复可行的
    **最小观测删除集合**（按删除数量、观测 ID 字典序唯一确定），返回待删观测 ID、
    修复后的诊断摘要，以及是否触及删除上限；
-5. **校准方案**：基础观测可行时，从至多 12 条带非负整数成本的候选校准观测中，
+5. **统一余量放宽**：现场各观测存在统一的整数毫秒测量余量时，接收非负整数上限
+   **L**，对每条观测下界同减、上界同加同一个非负整数 k（观测不删除），在
+   `0 ≤ k ≤ L` 中求使**全组**同时可行的**最小 k**；找到时返回 k、按原 ID 对应
+   的放宽后区间（k=0 即原区间）与参考节点偏移为 0 的全节点可行见证；上限内无解
+   时只回报超限，不输出放宽区间或见证；重复 ID、非法区间或非法上限返回输入错误；
+6. **校准方案**：基础观测可行时，从至多 12 条带非负整数成本的候选校准观测中，
    选择使各目标节点相对参考节点的界宽达标的**总成本最小子集**
    （同成本先比条数、再比 ID 序列字典序），返回选中 ID、总成本与加入后的诊断；
-6. **窗口峰值**：在「真实时间 = 本地时间戳 − 节点偏移、参考节点偏移为 0」的
+7. **窗口峰值**：在「真实时间 = 本地时间戳 − 节点偏移、参考节点偏移为 0」的
    约定下，求**可同时落入给定真实时间窗口的最大事件集合**（至多 12 条事件，
    并列时选排序后事件 ID 序列字典序最小者），并返回一组覆盖全部节点、
    满足全部观测的**可行偏移见证**——该见证下入窗事件恰为所选集合；
-7. **冗余审计**：基础观测可行时，逐条暂移观测（至多 30 条），检验其区间是否
+8. **冗余审计**：基础观测可行时，逐条暂移观测（至多 30 条），检验其区间是否
    已被其余观测蕴含——剩余观测推出的 `target − source` 最紧下界不小于原
    `min`、最紧上界不大于原 `max` 时标为冗余，并附**不含自身 ID** 的上下界
    替代证据链及界值；基础观测矛盾时直接返回现有矛盾环；
-8. **时间漂移诊断**：提交带**整数采样秒数**的有向观测与各非参考节点的
+9. **时间漂移诊断**：提交带**整数采样秒数**的有向观测与各非参考节点的
    **非负最大漂移速率**（毫秒/秒），在时间展开的差分约束图上判断**整条时间轴
    是否可行**；可行时按查询秒数（至多 8 个）与节点排序给出各时刻相对参考节点
    的最紧偏移上下界，不可达方向为 `null`；不可行时返回包含**原观测 ID 或漂移
    时段标识**的矛盾环；
-9. 提供 **批量诊断接口**，结果按提交下标稳定返回；
-10. **跨节点日志因果一致性**：接收至多 20 条事件（ID、节点、本地毫秒时间戳）
+10. 提供 **批量诊断接口**，结果按提交下标稳定返回；
+11. **跨节点日志因果一致性**：接收至多 20 条事件（ID、节点、本地毫秒时间戳）
     与至多 40 条因果关系（ID、前后事件 ID、非负最小间隔毫秒），在
     「真实时间 = 本地时间戳 − 节点偏移、参考节点偏移为 0」的同一组偏移下，
     核验全部静态观测与关系能否同时成立；可行时返回全部节点偏移见证与各事件
@@ -339,6 +344,137 @@ curl -s -X POST http://localhost:8000/api/v1/diagnose/repair \
     }
   }
 }
+```
+
+### `POST /api/v1/diagnose/slack` — 统一余量放宽
+
+现场各观测都带有统一的整数毫秒测量余量。给定**非负整数上限 L**（请求字段名
+`L`），对每条观测把**下界同减、上界同加同一个非负整数 k**：
+
+```
+[min, max]  →  [min - k, max + k]
+```
+
+在 `0 ≤ k ≤ L` 中求使**全组观测同时成立**（整组差分约束图无负环）的**最小 k**；
+观测不删除，且可行性必须由全组共同判定，不能依据单条观测下结论。放宽只放松
+约束，因此「可行 k」构成后缀区间（k 可行则更大值必可行），服务在区间上二分
+求最小值。
+
+请求体沿用单条诊断请求的全部字段（`reference` / `observations` / 可选
+`nodes` / `name`），另加：
+
+| 字段 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `L` | integer | 是 | 统一余量上限（非负整数毫秒）；拒绝布尔、浮点、字符串、负数或缺省 |
+
+`status="ok"` 响应字段：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `status` | string | 固定 `"ok"` |
+| `name` | string/null | 请求名称回显 |
+| `reference` | string | 参考时钟节点 |
+| `limit` | integer | 本次生效的上限 L |
+| `slack` | integer | 使全组可行的最小统一余量 k（`0 ≤ k ≤ L`） |
+| `observations` | object[] | 按原 ID 对应的放宽后区间（按 ID 字典序）；`k=0` 时即原区间 |
+| `observations[].min/max` | number | 放宽后下界 `min - k` / 上界 `max + k` |
+| `node_offsets` | object[] | 覆盖全部求解节点的可行偏移见证（按节点字典序），参考节点偏移恒为 0 |
+
+即使放宽到 L 仍有负环时返回 `status="limit_exceeded"`，响应只含
+`status` / `name` / `reference` / `limit`，**不输出** `slack`、放宽区间或见证；
+可调大 `L` 重试。
+
+#### 最小余量求解（示例）
+
+`x_B - x_A ∈ [0,10]` 与 `x_B - x_A ∈ [-4,-3]` 矛盾；放宽后两区间
+`[-k,10+k]` 与 `[-4-k,-3+k]` 相交要求 `2k ≥ 3`，最小整数 k = 2：
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/diagnose/slack \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "reference": "A",
+    "L": 5,
+    "observations": [
+      {"id": "o1", "source": "A", "target": "B", "min": 0, "max": 10},
+      {"id": "o2", "source": "B", "target": "A", "min": 3, "max": 4}
+    ]
+  }'
+```
+
+```json
+{
+  "status": "ok",
+  "name": null,
+  "reference": "A",
+  "limit": 5,
+  "slack": 2,
+  "observations": [
+    {"id": "o1", "source": "A", "target": "B", "min": -2.0, "max": 12.0},
+    {"id": "o2", "source": "B", "target": "A", "min": 1.0, "max": 6.0}
+  ],
+  "node_offsets": [
+    {"node": "A", "offset": 0.0},
+    {"node": "B", "offset": -1.0}
+  ]
+}
+```
+
+见证满足每条放宽后区间（如 `x_B - x_A = -1 ∈ [-2,12]`，
+`x_A - x_B = 1 ∈ [1,6]`）。
+
+#### 原系统本就可行（k=0，原区间照返）
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/diagnose/slack \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "reference": "A",
+    "L": 0,
+    "observations": [
+      {"id": "o1", "source": "A", "target": "B", "min": 1, "max": 5}
+    ]
+  }'
+```
+
+`slack` 为 `0`，`observations` 中原样返回 `[1, 5]`。
+
+#### 超过上限（示例）
+
+同一组矛盾在 `L=1`（小于所需的 2）时：
+
+```json
+{
+  "status": "limit_exceeded",
+  "name": null,
+  "reference": "A",
+  "limit": 1
+}
+```
+
+Python 调用示例：
+
+```python
+import httpx
+
+resp = httpx.post(
+    "http://localhost:8000/api/v1/diagnose/slack",
+    json={
+        "reference": "A",
+        "L": 5,
+        "observations": [
+            {"id": "o1", "source": "A", "target": "B", "min": 0, "max": 10},
+            {"id": "o2", "source": "B", "target": "A", "min": 3, "max": 4},
+        ],
+    },
+)
+result = resp.json()
+if result["status"] == "ok":
+    print("最小余量 k =", result["slack"])
+    print("放宽后区间 =", result["observations"])
+    print("偏移见证 =", result["node_offsets"])
+else:
+    print("上限 L =", result["limit"], "内无解")
 ```
 
 ### `POST /api/v1/diagnose/calibration-plan` — 校准方案
@@ -1058,7 +1194,8 @@ curl -s -X POST http://localhost:8000/api/v1/diagnose/batch \
 ### 校验错误
 
 非法区间（`min > max`）、重复观测 ID、`reference` 不在 `nodes` 中等请求问题返回
-HTTP `422` 及详细错误信息。校准方案接口还会拒绝：`targets` 为空或目标重复、
+HTTP `422` 及详细错误信息。统一余量放宽接口还会拒绝：上限 `L` 缺省、为负数或
+非整数（含布尔、浮点、字符串）。校准方案接口还会拒绝：`targets` 为空或目标重复、
 `max_width < 0`、候选超过 12 条、候选成本为负或非整数、候选 ID 彼此重复或与
 基础观测 ID 冲突、候选区间非法等。窗口峰值接口还会拒绝：`events` 超过 12 条、
 事件 ID 重复、事件时间戳非有限数值（NaN/±inf）、窗口端点非有限数值或
@@ -1089,6 +1226,12 @@ HTTP `422` 及详细错误信息。校准方案接口还会拒绝：`targets` �
   的最短路本身；链即界的可审计解释；
 - **修复**：穷举删除子集（按删除数量、观测 ID 字典序），首个使剩余图无负环的
   集合即唯一修复建议；删除全部观测必然可行，因此上限不小于观测总数时必有解；
+- **统一余量放宽**：对全部观测施加同一个非负整数 k，区间变为
+  `[min − k, max + k]`，两条差分边权重变为 `max + k` 与 `-min + k`。
+  放宽只放松约束，故可行 k 构成后缀区间，在 `[0, L]` 上二分最小可行值；
+  可行性始终由**整组**图的负环检测判定（自环非法观测也能被整组检测发现），
+  不依据单条观测。找到后用零超源可行势整体平移至参考节点为 0 作为全节点
+  偏移见证；L 处仍有负环即上限内无解，只回报超限。
 - **校准**：候选至多 12 条，穷举至多 2^12 = 4096 个子集；每个子集先做负环
   检测（矛盾组合不可选），可行时再跑双向最短路核对各目标界宽；按
   (总成本, 条数, ID 序列字典序) 比较，答案与候选提交顺序无关；
@@ -1138,9 +1281,9 @@ HTTP `422` 及详细错误信息。校准方案接口还会拒绝：`targets` �
 
 ```
 app/
-  main.py      # FastAPI 路由：/api/v1/diagnose、/api/v1/diagnose/drift、/api/v1/diagnose/batch、/api/v1/diagnose/repair、/api/v1/diagnose/calibration-plan、/api/v1/diagnose/redundancy-audit、/api/v1/events/window-peak、/api/v1/events/causal-consistency、/health
-  models.py    # 请求/响应 Pydantic 模型与入参校验（含时间漂移、因果一致性请求/矛盾环模型）
-  solver.py    # 差分约束建模、Bellman-Ford、证据链规范选择、负环提取与规范化、最小删除集合搜索、最小成本校准方案、窗口峰值求解与可行偏移见证、逐条观测冗余审计、时间展开的漂移诊断、跨节点日志因果一致性核验
+  main.py      # FastAPI 路由：/api/v1/diagnose、/api/v1/diagnose/slack、/api/v1/diagnose/drift、/api/v1/diagnose/batch、/api/v1/diagnose/repair、/api/v1/diagnose/calibration-plan、/api/v1/diagnose/redundancy-audit、/api/v1/events/window-peak、/api/v1/events/causal-consistency、/health
+  models.py    # 请求/响应 Pydantic 模型与入参校验（含统一余量放宽、时间漂移、因果一致性请求/矛盾环模型）
+  solver.py    # 差分约束建模、Bellman-Ford、证据链规范选择、负环提取与规范化、最小删除集合搜索、统一余量二分放宽与可行偏移见证、最小成本校准方案、窗口峰值求解与可行偏移见证、逐条观测冗余审计、时间展开的漂移诊断、跨节点日志因果一致性核验
 tests/         # 算法层与 HTTP 接口测试
 Dockerfile
 docker-compose.yml

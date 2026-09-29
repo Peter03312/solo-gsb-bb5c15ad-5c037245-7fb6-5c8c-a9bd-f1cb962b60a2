@@ -43,6 +43,16 @@
 最小观测删除集合：按 (删除数量, 观测 ID 字典序) 递增枚举候选，首个可行
 集合即唯一答案，与观测的提交顺序无关。
 
+统一余量放宽
+------------
+``find_uniform_slack`` 对全部观测施加同一个非负整数余量 k：每条观测放宽
+为 ``[min - k, max + k]``，观测不删除。可行余量构成后缀区间（k 可行则
+更大值必可行），故在 ``[0, limit]`` 上二分最小可行 k；可行性始终由整组
+观测构成的差分约束图是否存在负环判定，不依据单条观测下结论。找到时返回
+放宽后区间（按原 ID 对应，k=0 即原区间）与参考节点偏移为 0 的全节点
+可行见证（零超源可行势平移）；上限处仍有负环时只回报超限，不输出区间与
+见证。
+
 校准方案
 --------
 ``plan_calibration`` 在基础观测之外，从至多 12 条带非负整数成本的候选
@@ -605,6 +615,110 @@ def suggest_repair(
             if _is_feasible(nodes, remaining):
                 return [o.id for o in combo], remaining
     return None, None
+
+
+# ---------------------------------------------------------------------------
+# 统一余量放宽
+# ---------------------------------------------------------------------------
+
+
+def _relaxed_observations(
+    observations: Sequence[Observation], slack: int
+) -> List[Observation]:
+    """把每条观测统一放宽为 ``[min - slack, max + slack]``（不修改原对象）。"""
+    return [
+        Observation(
+            id=o.id,
+            source=o.source,
+            target=o.target,
+            min=_norm(o.min - slack),
+            max=_norm(o.max + slack),
+        )
+        for o in observations
+    ]
+
+
+def find_uniform_slack(
+    nodes: Sequence[str],
+    reference: str,
+    observations: Sequence[Observation],
+    limit: int,
+):
+    """对全部观测施加同一个非负整数余量 ``slack``，求使全组可行的最小余量。
+
+    每条观测放宽为 ``x_target - x_source ∈ [min - slack, max + slack]``，
+    即其两条差分约束边的权重分别变为 ``max + slack`` 与 ``-min + slack``。
+    放宽只放松约束、从不收紧，因此可行余量构成后缀区间
+    （``slack`` 可行则更大值必可行），可在 ``[0, limit]`` 上二分求最小值；
+    可行性始终由**整组观测构成的差分约束图是否存在负环**判定，
+    不依据任何单条观测单独下结论，观测也不会被删除。
+
+    返回字典：
+
+    * 上限内可行 -> ``{"status": "ok", "reference": ..., "limit": limit,
+      "slack": k, "observations": [...], "node_offsets": [...]}``：
+
+      - ``slack`` 为 ``0 <= k <= limit`` 中使全组可行的最小非负整数；
+      - ``observations`` 为按原 ID 对应的放宽后区间
+        ``{id, source, target, min, max}``（按 ID 排序；``k=0`` 时即原区间）；
+      - ``node_offsets`` 为覆盖全部节点的可行偏移见证
+        （按节点字典序，参考节点偏移恒为 0），由放宽后系统的零超源
+        最短路可行势整体平移得到；
+
+    * 即使放宽到 ``limit`` 仍有负环 ->
+      ``{"status": "limit_exceeded", "reference": ..., "limit": limit}``，
+      不输出放宽区间与见证。
+    """
+    ordered_nodes = sorted(set(nodes))
+    ordered = sorted(observations, key=lambda o: o.id)
+
+    def feasible(slack: int) -> bool:
+        relaxed = _relaxed_observations(ordered, slack)
+        return _extract_negative_cycle(
+            _build_edges(relaxed), ordered_nodes
+        ) is None
+
+    # 先检验上界：上限处仍不可行则整段 [0, limit] 都不可行（单调性）。
+    if not feasible(limit):
+        return {
+            "status": "limit_exceeded",
+            "reference": reference,
+            "limit": limit,
+        }
+
+    # 二分最小可行余量：可行集为后缀，谓词单调。
+    lo, hi = 0, limit
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if feasible(mid):
+            hi = mid
+        else:
+            lo = mid + 1
+    slack = lo
+
+    relaxed = _relaxed_observations(ordered, slack)
+    edges = _build_edges(relaxed)
+    offsets = _feasible_potentials(edges, ordered_nodes, reference)
+    return {
+        "status": "ok",
+        "reference": reference,
+        "limit": limit,
+        "slack": slack,
+        "observations": [
+            {
+                "id": o.id,
+                "source": o.source,
+                "target": o.target,
+                "min": _norm(o.min),
+                "max": _norm(o.max),
+            }
+            for o in relaxed
+        ],
+        "node_offsets": [
+            {"node": node, "offset": _norm(offsets[node])}
+            for node in ordered_nodes
+        ],
+    }
 
 
 # ---------------------------------------------------------------------------

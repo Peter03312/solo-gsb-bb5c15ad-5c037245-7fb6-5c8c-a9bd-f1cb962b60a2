@@ -910,3 +910,84 @@ class InfeasibleCausalDiagnosis(BaseModel):
 
 
 CausalConsistencyResponse = Union[FeasibleCausalDiagnosis, InfeasibleCausalDiagnosis]
+
+
+# ---------------------------------------------------------------------------
+# 统一放宽余量
+# ---------------------------------------------------------------------------
+
+
+def _validate_non_negative_int(value):
+    """非负整数字段的前置校验：只接受 int（拒绝 bool / 浮点 / 字符串）。
+
+    与整数秒校验同理：必须在 Pydantic v2 的宽松 int 收窄之前执行，
+    否则 bool / 2.0 / "3" 会被默认接受为 int。
+    """
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError("必须为非负整数")
+    if value < 0:
+        raise ValueError("必须为非负整数")
+    return value
+
+
+# 非负整数：经过前置严格类型校验的 int。
+NonNegativeInt = Annotated[int, BeforeValidator(_validate_non_negative_int)]
+
+
+class RelaxDiagnosisRequest(DiagnosisRequest):
+    """统一放宽余量请求：沿用单条诊断的全部字段，另给非负整数放宽上限 L。"""
+
+    limit: NonNegativeInt = Field(
+        ...,
+        ge=0,
+        description="放宽量上限 L（非负整数，不接受布尔/浮点/字符串）；"
+        "在 0 <= k <= L 内寻找最小可行放宽量 k",
+    )
+
+
+class RelaxedObservation(BaseModel):
+    """一条观测按最小可行 k 统一放宽后的区间（按原 ID 对应）。"""
+
+    id: str = Field(..., description="原观测 ID（不删除、不改 ID）")
+    source: str = Field(..., description="被减时钟节点 A（与原观测一致）")
+    target: str = Field(..., description="被减时钟节点 B（与原观测一致）")
+    min: float = Field(
+        ..., alias="min", description="放宽后下界 = 原 min - k（毫秒）"
+    )
+    max: float = Field(
+        ..., alias="max", description="放宽后上界 = 原 max + k（毫秒）"
+    )
+
+    model_config = {"populate_by_name": True}
+
+
+class RelaxDiagnosisResponse(BaseModel):
+    """统一放宽余量响应。
+
+    * ``status="ok"``：在 [0, limit] 内找到最小可行放宽量 ``k``（k=0 时
+      原系统本就可行，放宽后区间照返原值），``widened`` 按原 ID 给出每条
+      观测放宽后的区间，``node_offsets`` 为参考节点偏移 0、覆盖全部节点
+      且满足全部放宽后观测的可行见证；
+    * ``status="limit_exceeded"``：放宽到 ``limit`` 后全组仍不可行，
+      ``k`` / ``widened`` / ``node_offsets`` 均为 ``null``，不输出放宽区间
+      与见证。可行性由全图负环判定，不能只根据单条观测判断。
+    """
+
+    name: Optional[str] = None
+    status: Literal["ok", "limit_exceeded"] = Field(..., description="求解状态")
+    limit: int = Field(..., description="本次生效的放宽上限 L")
+    k: Optional[int] = Field(
+        ...,
+        description="最小可行放宽量（0 <= k <= limit）；limit_exceeded 时为 null",
+    )
+    reference: str = Field(..., description="参考时钟节点（见证中偏移恒为 0）")
+    widened: Optional[List[RelaxedObservation]] = Field(
+        ...,
+        description="按原观测 ID 排序的放宽后区间（下界-k、上界+k）；"
+        "limit_exceeded 时为 null",
+    )
+    node_offsets: Optional[List[NodeOffset]] = Field(
+        ...,
+        description="覆盖全部节点的可行偏移见证（按节点字典序，参考节点为 0）；"
+        "limit_exceeded 时为 null",
+    )

@@ -81,6 +81,17 @@
 ID）；可行时由零超源最短路给出参考节点为 0 的偏移见证，并据
 ``t - x_n`` 给出各事件真实时间。节点与事件均按 ID 排序，
 环选择与提交顺序无关。
+
+统一放宽余量
+------------
+``relax_observations`` 对每条观测施加同一个非负整数放宽量 k：
+下界变为 ``min - k``、上界变为 ``max + k``（观测不删除）。展开后的
+每条差分边权都恰增加 k，因此任意 m 边环的环权由 b 变为 ``b + m*k``：
+可行性随 k 单调，0..L 内可行段为后缀，二分即可求出最小 k。可行性始终
+由**全图**负环检测决定——单条 ``min <= max`` 的观测不可能自相矛盾，
+矛盾必来自多条观测（或自环）构成的环，不能只看单条观测。可行时返回
+按原 ID 的放宽后区间，以及与窗口峰值 / 因果一致性同构的零超源可行势
+（整体平移至参考节点偏移为 0）作为全节点见证；L 内无解时只报超限。
 """
 
 from __future__ import annotations
@@ -1264,4 +1275,114 @@ def diagnose_causal(
         "reference": reference,
         "node_offsets": node_offsets,
         "event_times": event_times,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 统一放宽余量
+# ---------------------------------------------------------------------------
+
+
+def _relaxed_observations(
+    observations: Sequence[Observation], k: int
+) -> List[Observation]:
+    """返回每条观测统一放宽 k 后的副本：``[min - k, max + k]``。"""
+    return [
+        Observation(
+            id=o.id,
+            source=o.source,
+            target=o.target,
+            min=o.min - k,
+            max=o.max + k,
+        )
+        for o in observations
+    ]
+
+
+def _relaxed_feasible(
+    nodes: Sequence[str], observations: Sequence[Observation], k: int
+) -> bool:
+    """全组观测统一放宽 k 后是否可行（全图负环检测）。
+
+    单条 ``min <= max`` 的观测永远不可能自相矛盾：矛盾只能由跨多条观测
+    （含同节点自环）的负环给出，因此必须在完整约束图上判定。
+    """
+    widened = _relaxed_observations(observations, k)
+    edges = _build_edges(widened)
+    return _extract_negative_cycle(edges, nodes) is None
+
+
+def relax_observations(
+    nodes: Sequence[str],
+    reference: str,
+    observations: Sequence[Observation],
+    limit: int,
+):
+    """求使全组观测统一放宽后可行的最小非负整数 k（``0 <= k <= limit``）。
+
+    放宽量 k 对每条观测同一生效：``min -> min - k``、``max -> max + k``，
+    任何观测都不删除。展开后每条边权恰增加 k，故任意环 C 的环权由
+    ``sum w`` 变为 ``sum w + |C| * k``：
+
+      * 环权 ⇔ 可行性，放宽单调，故可行的 k 构成整数区间上的后缀；
+      * 在 [0, limit] 上二分即可取到最小可行 k（log(limit+1) 次全图
+        负环检测）；
+      * 可行性只能由全图负环给出：自环（min > max）是单边环，
+        两条反向观测是双边环，更长的环同样参与判定——不能只看单条观测。
+
+    返回字典：
+      成功   -> {"status": "ok", "limit": int, "k": int, "reference": str,
+                 "widened": [{"id", "source", "target", "min", "max"}, ...],
+                 "node_offsets": [{"node", "offset"}, ...]}
+                widened 按原观测 ID 排序（k=0 时即原区间）；node_offsets
+                覆盖全部节点并按节点字典序，参考节点恒为 0，且该见证
+                满足全部放宽后观测。
+      超限   -> {"status": "limit_exceeded", "limit": int,
+                 "reference": str, "required_gt_limit": True}
+                不含放宽区间与见证。
+
+    调用方须保证 limit 为非负整数；输入观测不会被修改。
+    """
+    ordered_nodes = sorted(set(nodes))
+    ordered = sorted(observations, key=lambda o: o.id)
+
+    if not _relaxed_feasible(ordered_nodes, ordered, limit):
+        return {
+            "status": "limit_exceeded",
+            "limit": limit,
+            "reference": reference,
+            "required_gt_limit": True,
+        }
+
+    # 可行性在 k 上单调：二分 [0, limit] 中最小的可行 k。
+    lo, hi = 0, limit
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if _relaxed_feasible(ordered_nodes, ordered, mid):
+            hi = mid
+        else:
+            lo = mid + 1
+    k = lo
+
+    widened = _relaxed_observations(ordered, k)
+    edges = _build_edges(widened)
+    offsets = _feasible_potentials(edges, ordered_nodes, reference)
+    return {
+        "status": "ok",
+        "limit": limit,
+        "k": k,
+        "reference": reference,
+        "widened": [
+            {
+                "id": o.id,
+                "source": o.source,
+                "target": o.target,
+                "min": _norm(o.min),
+                "max": _norm(o.max),
+            }
+            for o in widened
+        ],
+        "node_offsets": [
+            {"node": node, "offset": _norm(offsets[node])} for node in ordered_nodes
+        ],
     }

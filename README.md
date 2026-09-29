@@ -33,7 +33,13 @@
     与至多 40 条因果关系（ID、前后事件 ID、非负最小间隔毫秒），在
     「真实时间 = 本地时间戳 − 节点偏移、参考节点偏移为 0」的同一组偏移下，
     核验全部静态观测与关系能否同时成立；可行时返回全部节点偏移见证与各事件
-    真实时间，不可行时返回由观测/关系步骤构成的闭合负环。
+    真实时间，不可行时返回由观测/关系步骤构成的闭合负环；
+11. **统一放宽余量**：各观测都带统一的整数毫秒测量余量时，在
+    **不删除任何观测**的前提下，对每条观测把下界减去同一个非负整数 `k`、
+    上界加 `k`，在给定上限 `L`（`0 ≤ k ≤ L`）内求使**全组同时可行**的
+    **最小 `k`**；找到时返回 `k`、按原 ID 对应的放宽后区间与参考节点偏移
+    为 0 的全节点可行见证（`k=0` 时原区间照返）；`L` 内无解时只报超限，
+    不输出放宽区间与见证。可行性由**全图负环**决定，不能只根据单条观测判断。
 
 算法：差分约束图 + Bellman-Ford（超源初始化检测负环、前驱指针回卷提取矛盾环），
 纯 Python 标准实现，无外部服务依赖。
@@ -1032,6 +1038,122 @@ curl -s -X POST http://localhost:8000/api/v1/events/causal-consistency \
 （如 B@1000 → B@1020 却要求间隔 ≥ 30，自环权 `20 − 30 = -10`），
 单步即构成闭合负环。
 
+### `POST /api/v1/diagnose/relax` — 统一放宽余量
+
+现场时钟观测各带有统一的整数毫秒测量余量时，用本接口在**不删除任何观测**
+的前提下，求需要把余量统一扩大多少，才能让全部观测同时成立。
+
+放宽规则：给定同一个非负整数放宽量 `k`，每条观测的区间由 `[min, max]`
+变为 **`[min − k, max + k]`**（下界减 `k`、上界加 `k`）。在
+**`0 ≤ k ≤ limit`** 中求使全组可行的**最小 `k`**。
+
+请求体沿用单条诊断的全部字段（`reference` / `observations` / `nodes` /
+`name`，观测 ID 不可重复、区间须 `min ≤ max`），另增加：
+
+| 字段 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `limit` | integer | 是 | 放宽上限 L（**非负整数**，不接受布尔 / 浮点 / 字符串）；在 `0 ≤ k ≤ L` 内寻找最小可行 `k` |
+
+为什么不能只看单条观测：单条 `min ≤ max` 的观测永远自洽，矛盾必来自
+**跨多条观测构成的环**（两条反向观测的双边环、同向不交区间的下界边环、
+更长的链式环，或与参考节点不连通分量上的环）。展开后每条差分边权都恰增加
+`k`，所以任一边数为 `m`、原环权为 `b < 0` 的环在放宽 `k` 后环权为
+`b + m·k`；可行性随 `k` 单调，服务在 `[0, limit]` 上二分，全图负环检测
+通过即最小可行 `k`。
+
+响应字段：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `status` | string | `ok` / `limit_exceeded` |
+| `limit` | integer | 本次生效的放宽上限 L |
+| `k` | integer/null | 最小可行放宽量（`0 ≤ k ≤ limit`）；超限或输入错误语境下为 `null` |
+| `reference` | string | 参考时钟节点（见证中偏移恒为 0） |
+| `widened` | array/null | 按**原观测 ID** 排序的放宽后区间 `{id, source, target, min, max}`（`min = 原 min − k`、`max = 原 max + k`）；超限时为 `null` |
+| `node_offsets` | array/null | 覆盖全部节点的可行偏移见证（`{node, offset}`，按节点字典序，参考节点恒为 0，满足全部放宽后观测）；超限时为 `null` |
+
+两种情形：
+
+- **`status="ok"`**：`k=0` 表示原系统本就可行，放宽后区间**原样返回**；
+  `k>0` 时每条观测按 `k` 对称放宽，`widened` 与原观测一一对应（ID / source /
+  target 不变），`node_offsets` 给出参考节点偏移为 0 的全节点可行见证；
+- **`status="limit_exceeded"`**：放宽到 `limit` 后全组仍存在负环，
+  `k` / `widened` / `node_offsets` 均为 `null`——**不输出放宽区间或见证**，
+  可调大 `limit` 重试。
+
+#### 最小放宽量（示例）
+
+两条反向观测在原区间下矛盾（`B−A ∈ [0,10]` 与 `B−A ∈ [-4,-3]`）：
+环权 `-3 + 0 = -3` 的双边环，放宽 `k` 后环权 `-3 + 2k`，故最小 `k=2`：
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/diagnose/relax \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "reference": "A",
+    "limit": 5,
+    "observations": [
+      {"id": "o1", "source": "A", "target": "B", "min": 0, "max": 10},
+      {"id": "o2", "source": "B", "target": "A", "min": 3, "max": 4}
+    ]
+  }'
+```
+
+```json
+{
+  "name": null,
+  "status": "ok",
+  "limit": 5,
+  "k": 2,
+  "reference": "A",
+  "widened": [
+    {"id": "o1", "source": "A", "target": "B", "min": -2.0, "max": 12.0},
+    {"id": "o2", "source": "B", "target": "A", "min": 1.0, "max": 6.0}
+  ],
+  "node_offsets": [
+    {"node": "A", "offset": 0.0},
+    {"node": "B", "offset": -1.0}
+  ]
+}
+```
+
+见证 `x_A = 0, x_B = -1` 下：`x_B - x_A = -1 ∈ [-2, 12]`（o1），
+`x_A - x_B = 1 ∈ [1, 6]`（o2），全部成立。注意此时两条放宽后区间
+`[-2,12]` 与 `[-6,-1]` 关于 `B−A` 的交集恰为 `{-1}`，`k=1` 时交集为空，
+故 2 确为最小值。
+
+#### 上限内无解（示例）
+
+同一组观测把上限收紧到 `1` 时仍有负环，只报超限，不返回放宽区间或见证：
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/diagnose/relax \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "reference": "A",
+    "limit": 1,
+    "observations": [
+      {"id": "o1", "source": "A", "target": "B", "min": 0, "max": 10},
+      {"id": "o2", "source": "B", "target": "A", "min": 3, "max": 4}
+    ]
+  }'
+```
+
+```json
+{
+  "name": null,
+  "status": "limit_exceeded",
+  "limit": 1,
+  "k": null,
+  "reference": "A",
+  "widened": null,
+  "node_offsets": null
+}
+```
+
+矛盾环也可能完全位于与参考节点不连通的分量上，全图负环检测同样会计入，
+不会因某条观测单独合法而误判可行。
+
 ### `POST /api/v1/diagnose/batch` — 批量诊断
 
 请求体 `{"diagnoses": [ <单条请求>, ... ]}`（至少 1 条）。每条可带 `name`，
@@ -1069,7 +1191,9 @@ HTTP `422` 及详细错误信息。校准方案接口还会拒绝：`targets` �
 速率为负或非有限数值等。因果一致性接口还会拒绝：事件超过 20 条、关系超过
 40 条、事件 ID 重复、关系 ID 重复（两类 ID 仅在各自类别内唯一，跨类别允许
 重名）、关系的前后事件 ID 在 `events` 中不存在（悬空引用）、最小间隔为负、
-事件时间戳或最小间隔为非有限数值等。
+事件时间戳或最小间隔为非有限数值等。统一放宽接口还会拒绝：`limit` 缺失或
+不是非负整数（含布尔、浮点、字符串、负数）；其余重复观测 ID、非法区间等
+输入错误同样返回 422（观测本身 `min > max` 属非法输入，而非待放宽的矛盾）。
 
 ---
 
@@ -1124,6 +1248,15 @@ HTTP `422` 及详细错误信息。校准方案接口还会拒绝：`targets` �
   `t − x_n` 给出。节点宇宙取原诊断节点（显式 `nodes` ∪ `reference` ∪
   观测端点）与事件节点的并集；节点与事件按 ID 排序，矛盾环按
   (起点节点, 原 ID, 类型) 规范化旋转，结果与提交顺序无关。
+- **统一放宽余量**：放宽量 k 对每条观测同一生效（`min − k` / `max + k`），
+  展开后**每条差分边权恰增加 k**；任一边数为 m、原环权 b 的环放宽后环权为
+  `b + m·k`，故可行性在 k 上单调（可行段为后缀），在 `[0, L]` 上二分取最小
+  可行 k，每次判定都跑**全图** Bellman-Ford 负环检测——单条 `min ≤ max`
+  的观测不可能自相矛盾，矛盾必来自跨观测的环（含不连通分量），不能只看
+  单条观测；超限时只报 `limit_exceeded`，不输出放宽区间与见证。可行见证
+  与窗口峰值 / 因果一致性同构：零超源最短路求可行势后整体平移至参考节点
+  为 0，覆盖「显式 `nodes` ∪ `reference` ∪ 观测端点」；放宽后区间按原
+  观测 ID 排序返回，`k=0` 时即原区间。
 
 结果顺序的确定性保证：
 
@@ -1138,9 +1271,9 @@ HTTP `422` 及详细错误信息。校准方案接口还会拒绝：`targets` �
 
 ```
 app/
-  main.py      # FastAPI 路由：/api/v1/diagnose、/api/v1/diagnose/drift、/api/v1/diagnose/batch、/api/v1/diagnose/repair、/api/v1/diagnose/calibration-plan、/api/v1/diagnose/redundancy-audit、/api/v1/events/window-peak、/api/v1/events/causal-consistency、/health
-  models.py    # 请求/响应 Pydantic 模型与入参校验（含时间漂移、因果一致性请求/矛盾环模型）
-  solver.py    # 差分约束建模、Bellman-Ford、证据链规范选择、负环提取与规范化、最小删除集合搜索、最小成本校准方案、窗口峰值求解与可行偏移见证、逐条观测冗余审计、时间展开的漂移诊断、跨节点日志因果一致性核验
+  main.py      # FastAPI 路由：/api/v1/diagnose、/api/v1/diagnose/drift、/api/v1/diagnose/batch、/api/v1/diagnose/repair、/api/v1/diagnose/calibration-plan、/api/v1/diagnose/redundancy-audit、/api/v1/diagnose/relax、/api/v1/events/window-peak、/api/v1/events/causal-consistency、/health
+  models.py    # 请求/响应 Pydantic 模型与入参校验（含时间漂移、因果一致性、统一放宽余量请求/响应模型）
+  solver.py    # 差分约束建模、Bellman-Ford、证据链规范选择、负环提取与规范化、最小删除集合搜索、最小成本校准方案、窗口峰值求解与可行偏移见证、逐条观测冗余审计、时间展开的漂移诊断、跨节点日志因果一致性核验、统一放宽量二分求解与见证
 tests/         # 算法层与 HTTP 接口测试
 Dockerfile
 docker-compose.yml

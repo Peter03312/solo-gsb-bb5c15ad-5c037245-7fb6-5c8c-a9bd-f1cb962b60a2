@@ -43,6 +43,9 @@ from .models import (
     RedundancyAuditRequest,
     RedundancyAuditResponse,
     RedundancyItem,
+    RelaxDiagnosisRequest,
+    RelaxDiagnosisResponse,
+    RelaxedObservation,
     RepairRequest,
     RepairResponse,
     TimePoint,
@@ -63,6 +66,7 @@ from .solver import (
     diagnose_drift,
     plan_calibration,
     plan_window_peak,
+    relax_observations,
     suggest_repair,
 )
 
@@ -82,8 +86,10 @@ app = FastAPI(
         "跨节点日志因果一致性接口在同一组时钟偏移下核验静态观测与"
         "事件间最小间隔关系能否同时成立，可行时给出偏移见证与各事件真实时间，"
         "不可行时返回闭合负环。"
+        "统一放宽接口在不删除任何观测的前提下，求使全组观测（下界-k、上界+k）"
+        "同时成立的最小非负整数放宽量，超限时只报超限，不输出放宽区间与见证。"
     ),
-    version="1.7.0",
+    version="1.8.0",
 )
 
 
@@ -581,4 +587,58 @@ def events_causal_consistency(request: CausalConsistencyRequest) -> CausalConsis
             accumulated_bound=cycle["accumulated_bound"],
             contradiction=cycle["contradiction"],
         ),
+    )
+
+
+# ---------------------------------------------------------------------------
+# 统一放宽余量
+# ---------------------------------------------------------------------------
+
+
+@app.post(
+    "/api/v1/diagnose/relax",
+    response_model=RelaxDiagnosisResponse,
+    tags=["diagnosis"],
+)
+def diagnose_relax(request: RelaxDiagnosisRequest) -> RelaxDiagnosisResponse:
+    """统一放宽余量：求使全部观测同时成立的最小非负整数放宽量 k。
+
+    对每条观测施加同一个放宽量 k：下界变为 ``min - k``、上界变为
+    ``max + k``，观测不删除。在 ``0 <= k <= limit`` 内二分最小可行 k；
+    可行性由**全图负环**决定（单条 ``min <= max`` 的观测不可能自相矛盾，
+    矛盾必来自跨观测的环），因此不能只看单条观测。
+
+    找到时返回 k、按原 ID 的放宽后区间（k=0 时原区间照返）与参考节点
+    偏移为 0 的全节点可行见证；放宽到上限仍不可行时只返回
+    ``status="limit_exceeded"``，不输出放宽区间与见证。重复 ID、非法
+    区间或非法（非非负整数）上限按输入错误返回 422。
+    """
+    result = relax_observations(
+        nodes=request.effective_nodes(),
+        reference=request.reference,
+        observations=[_to_observation(o) for o in request.observations],
+        limit=request.limit,
+    )
+    if result["status"] == "limit_exceeded":
+        return RelaxDiagnosisResponse(
+            name=request.name,
+            status="limit_exceeded",
+            limit=result["limit"],
+            k=None,
+            reference=result["reference"],
+            widened=None,
+            node_offsets=None,
+        )
+
+    return RelaxDiagnosisResponse(
+        name=request.name,
+        status="ok",
+        limit=result["limit"],
+        k=result["k"],
+        reference=result["reference"],
+        widened=[RelaxedObservation(**item) for item in result["widened"]],
+        node_offsets=[
+            NodeOffset(node=item["node"], offset=item["offset"])
+            for item in result["node_offsets"]
+        ],
     )
